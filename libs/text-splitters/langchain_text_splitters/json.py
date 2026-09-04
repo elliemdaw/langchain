@@ -91,7 +91,7 @@ class RecursiveJsonSplitter:
         """Split json into maximum size dictionaries while preserving structure."""
         current_path = current_path or []
         chunks = chunks if chunks is not None else [{}]
-        if isinstance(data, dict):
+        if isinstance(data, dict) and data:
             for key, value in data.items():
                 new_path = [*current_path, key]
                 chunk_size = self._json_size(chunks[-1])
@@ -108,8 +108,8 @@ class RecursiveJsonSplitter:
 
                     # Iterate
                     self._json_split(value, new_path, chunks)
-        else:
-            # handle single item
+        # Handle leaf values and empty dicts
+        elif current_path:
             self._set_nested_dict(chunks[-1], current_path, data)
         return chunks
 
@@ -127,11 +127,24 @@ class RecursiveJsonSplitter:
 
         Returns:
             A list of JSON chunks.
+
+        Raises:
+            TypeError: If `json_data` is not a dict and cannot be converted to
+                one. `None` returns an empty list rather than raising. A
+                top-level list is only accepted when `convert_lists` is `True`.
         """
+        is_list_input = isinstance(json_data, list)
+
         if convert_lists:
-            chunks = self._json_split(self._list_to_dict_preprocessing(json_data))
-        else:
-            chunks = self._json_split(json_data)
+            json_data = self._list_to_dict_preprocessing(json_data)
+
+        if json_data is not None and not isinstance(json_data, dict):
+            msg = f"json_data must be a dict, got {type(json_data).__name__}."
+            if is_list_input and not convert_lists:
+                msg += " Top-level lists can be split by passing convert_lists=True."
+            raise TypeError(msg)
+
+        chunks = self._json_split(json_data)
 
         # Remove the last chunk if it's empty
         if not chunks[-1]:

@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 from base64 import b64encode
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import anthropic
 import httpx
@@ -28,6 +28,15 @@ from langchain_core.messages import (
 from langchain_core.outputs import ChatGeneration, LLMResult
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
+    from langchain_core.language_models.chat_model_stream import (
+        AsyncChatModelStream,
+        ChatModelStream,
+    )
+from langchain_tests.utils.stream_lifecycle import assert_valid_event_stream
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
@@ -131,7 +140,7 @@ async def test_astream() -> None:
         "model": MODEL_NAME,
         "max_tokens": 1024,
         "messages": [{"role": "user", "content": "hi"}],
-        "temperature": 0.0,
+        "extra_body": {"temperature": 0.0},
     }
     stream = await async_client.messages.create(**params, stream=True)
     async for event in stream:
@@ -902,8 +911,17 @@ def test_agent_loop(output_version: Literal["v0", "v1"]) -> None:
 
 @pytest.mark.default_cassette("test_agent_loop_streaming.yaml.gz")
 @pytest.mark.vcr
-@pytest.mark.parametrize("output_version", ["v0", "v1"])
-def test_agent_loop_streaming(output_version: Literal["v0", "v1"]) -> None:
+@pytest.mark.parametrize(
+    ("output_version", "use_v2_stream"),
+    [
+        ("v0", False),
+        ("v1", False),
+        ("v1", True),
+    ],
+)
+def test_agent_loop_streaming(
+    output_version: Literal["v0", "v1"], *, use_v2_stream: bool
+) -> None:
     @tool
     def get_weather(location: str) -> str:
         """Get the weather for a location."""
@@ -916,7 +934,13 @@ def test_agent_loop_streaming(output_version: Literal["v0", "v1"]) -> None:
     )
     llm_with_tools = llm.bind_tools([get_weather])
     input_message = HumanMessage("What is the weather in San Francisco, CA?")
-    tool_call_message = llm_with_tools.invoke([input_message])
+    if use_v2_stream:
+        tool_call_message = cast(
+            "ChatModelStream",
+            llm_with_tools.stream_events([input_message], version="v3"),
+        ).output
+    else:
+        tool_call_message = llm_with_tools.invoke([input_message])
     assert isinstance(tool_call_message, AIMessage)
 
     tool_calls = tool_call_message.tool_calls
@@ -924,20 +948,81 @@ def test_agent_loop_streaming(output_version: Literal["v0", "v1"]) -> None:
     tool_call = tool_calls[0]
     tool_message = get_weather.invoke(tool_call)
     assert isinstance(tool_message, ToolMessage)
-    response = llm_with_tools.invoke(
-        [
-            input_message,
-            tool_call_message,
-            tool_message,
-        ]
+    if use_v2_stream:
+        response = cast(
+            "ChatModelStream",
+            llm_with_tools.stream_events(
+                [input_message, tool_call_message, tool_message],
+                version="v3",
+            ),
+        ).output
+    else:
+        response = llm_with_tools.invoke(
+            [
+                input_message,
+                tool_call_message,
+                tool_message,
+            ]
+        )
+    assert isinstance(response, AIMessage)
+
+
+@pytest.mark.default_cassette("test_agent_loop_streaming.yaml.gz")
+@pytest.mark.vcr
+async def test_agent_loop_streaming_astream_events_v3_v1() -> None:
+    """Async multi-turn through `astream_events(version="v3")`.
+
+    Mirrors `test_agent_loop_streaming` for `output_version="v1"` but
+    exercises `AsyncChatModelStream` end-to-end.
+    """
+
+    @tool
+    def get_weather(location: str) -> str:
+        """Get the weather for a location."""
+        return "It's sunny."
+
+    llm = ChatAnthropic(
+        model=MODEL_NAME,
+        streaming=True,
+        output_version="v1",  # type: ignore[call-arg]
+    )
+    llm_with_tools = llm.bind_tools([get_weather])
+    input_message = HumanMessage("What is the weather in San Francisco, CA?")
+    tool_call_message = await (
+        await cast(
+            "Awaitable[AsyncChatModelStream]",
+            llm_with_tools.astream_events([input_message], version="v3"),
+        )
+    )
+    assert isinstance(tool_call_message, AIMessage)
+    tool_calls = tool_call_message.tool_calls
+    assert len(tool_calls) == 1
+    tool_call = tool_calls[0]
+    tool_message = get_weather.invoke(tool_call)
+    assert isinstance(tool_message, ToolMessage)
+    response = await (
+        await cast(
+            "Awaitable[AsyncChatModelStream]",
+            llm_with_tools.astream_events(
+                [input_message, tool_call_message, tool_message],
+                version="v3",
+            ),
+        )
     )
     assert isinstance(response, AIMessage)
 
 
 @pytest.mark.default_cassette("test_citations.yaml.gz")
 @pytest.mark.vcr
-@pytest.mark.parametrize("output_version", ["v0", "v1"])
-def test_citations(output_version: Literal["v0", "v1"]) -> None:
+@pytest.mark.parametrize(
+    ("output_version", "use_v2_stream"),
+    [
+        ("v0", False),
+        ("v1", False),
+        ("v1", True),
+    ],
+)
+def test_citations(output_version: Literal["v0", "v1"], *, use_v2_stream: bool) -> None:
     llm = ChatAnthropic(model=MODEL_NAME, output_version=output_version)  # type: ignore[call-arg]
     messages = [
         {
@@ -967,10 +1052,19 @@ def test_citations(output_version: Literal["v0", "v1"]) -> None:
         assert any("citations" in block for block in response.content)
 
     # Test streaming
-    full: BaseMessageChunk | None = None
-    for chunk in llm.stream(messages):
-        full = cast("BaseMessageChunk", chunk) if full is None else full + chunk
-    assert isinstance(full, AIMessageChunk)
+    full: BaseMessage
+    if use_v2_stream:
+        full = llm.stream_events(messages, version="v3").output
+    else:
+        aggregated: BaseMessageChunk | None = None
+        for chunk in llm.stream(messages):
+            aggregated = (
+                cast("BaseMessageChunk", chunk)
+                if aggregated is None
+                else aggregated + chunk
+            )
+        assert isinstance(aggregated, AIMessageChunk)
+        full = aggregated
     assert isinstance(full.content, list)
     assert not any("citation" in block for block in full.content)
     if output_version == "v1":
@@ -1029,7 +1123,8 @@ def test_thinking() -> None:
 
 @pytest.mark.default_cassette("test_thinking.yaml.gz")
 @pytest.mark.vcr
-def test_thinking_v1() -> None:
+@pytest.mark.parametrize("use_v2_stream", [False, True])
+def test_thinking_v1(*, use_v2_stream: bool) -> None:
     llm = ChatAnthropic(
         model="claude-sonnet-4-5-20250929",  # type: ignore[call-arg]
         max_tokens=5_000,  # type: ignore[call-arg]
@@ -1051,10 +1146,19 @@ def test_thinking_v1() -> None:
             assert isinstance(signature, str)
 
     # Test streaming
-    full: BaseMessageChunk | None = None
-    for chunk in llm.stream([input_message]):
-        full = cast(BaseMessageChunk, chunk) if full is None else full + chunk
-    assert isinstance(full, AIMessageChunk)
+    full: BaseMessage
+    if use_v2_stream:
+        full = llm.stream_events([input_message], version="v3").output
+    else:
+        aggregated: BaseMessageChunk | None = None
+        for chunk in llm.stream([input_message]):
+            aggregated = (
+                cast(BaseMessageChunk, chunk)
+                if aggregated is None
+                else aggregated + chunk
+            )
+        assert isinstance(aggregated, AIMessageChunk)
+        full = aggregated
     assert isinstance(full.content, list)
     assert any("reasoning" in block for block in full.content)
     for block in full.content:
@@ -1159,11 +1263,14 @@ def test_structured_output_thinking_enabled() -> None:
         assert isinstance(chunk, GenerateUsername)
 
 
+@pytest.mark.retry(count=3, delay=1)
 def test_structured_output_thinking_force_tool_use() -> None:
     # Structured output currently relies on forced tool use, which is not supported
     # when `thinking` is enabled. When this test fails, it means that the feature
     # is supported and the workarounds in `with_structured_output` should be removed.
-    client = anthropic.Anthropic()
+    # Use the client resolved off `ChatAnthropic` so requests honor any
+    # configured base URL / credentials (e.g. the LangSmith gateway).
+    client = ChatAnthropic(model="claude-sonnet-4-5-20250929")._client  # type: ignore[call-arg]
     with pytest.raises(anthropic.BadRequestError):
         _ = client.messages.create(
             model="claude-sonnet-4-5-20250929",
@@ -1216,6 +1323,65 @@ def test_effort_parameter() -> None:
     assert result.usage_metadata["output_tokens"] > 0
 
 
+def test_reasoning_effort_parameter() -> None:
+    """Test that the standard `reasoning_effort` parameter is accepted by the API."""
+    llm = ChatAnthropic(
+        model="claude-opus-4-5-20251101",
+        reasoning_effort="medium",
+        max_tokens=100,
+    )
+
+    result = llm.invoke("Say hello in one sentence")
+
+    assert isinstance(result.content, str)
+    assert len(result.content) > 0
+    assert "model_name" in result.response_metadata
+    assert result.usage_metadata is not None
+    assert result.usage_metadata["input_tokens"] > 0
+    assert result.usage_metadata["output_tokens"] > 0
+
+
+def test_reasoning_effort_call_time_kwarg() -> None:
+    """Test that `reasoning_effort` is accepted as a call-time kwarg."""
+    llm = ChatAnthropic(model="claude-opus-4-5-20251101", max_tokens=100)
+
+    result = llm.invoke("Say hello in one sentence", reasoning_effort="low")
+
+    assert isinstance(result.content, str)
+    assert len(result.content) > 0
+    assert result.usage_metadata is not None
+
+
+def test_reasoning_effort_defaults_adaptive_thinking() -> None:
+    """`reasoning_effort` defaults `thinking` to adaptive on models that support it.
+
+    Regression test for a model (Opus 4.7+, Opus 5, Sonnet 5) actually accepting the
+    resulting `{"type": "adaptive", "display": "summarized"}` thinking config,
+    not just that the payload is well-formed locally.
+    """
+    llm = ChatAnthropic(
+        model="claude-opus-5",
+        reasoning_effort="high",
+        max_tokens=2_000,
+    )
+
+    # A genuine multi-step problem: adaptive thinking is model-decided, and a
+    # trivial prompt (e.g. "what is 3+4") may not surface a visible `thinking`
+    # block even when accepted, which would make this test flaky.
+    result = llm.invoke(
+        "A farmer has 17 sheep. All but 9 die. Then he buys triple the number "
+        "of remaining sheep, then sells half (rounding down). How many sheep "
+        "does he have now? Show your reasoning step by step."
+    )
+
+    assert isinstance(result.content, list)
+    assert any(
+        isinstance(block, dict) and block.get("type") == "thinking"
+        for block in result.content
+    )
+    assert result.usage_metadata is not None
+
+
 def test_image_tool_calling() -> None:
     """Test tool calling with image inputs."""
 
@@ -1231,7 +1397,7 @@ def test_image_tool_calling() -> None:
         },
     ]
     image_url = "https://raw.githubusercontent.com/langchain-ai/docs/4d11d08b6b0e210bd456943f7a22febbd168b543/src/images/agentic-rag-output.png"
-    image_data = b64encode(httpx.get(image_url).content).decode("utf-8")
+    image_data = b64encode(httpx.get(image_url, timeout=10.0).content).decode("utf-8")
     human_content.append(
         {
             "type": "image",
@@ -1718,17 +1884,22 @@ def test_code_execution_old(output_version: Literal["v0", "v1"]) -> None:
     )
 
 
+def _collect_file_ids(content: Any) -> list[str]:
+    """Recursively collect `file_id` values from response content."""
+    if isinstance(content, dict):
+        found = [content["file_id"]] if "file_id" in content else []
+        return found + [fid for v in content.values() for fid in _collect_file_ids(v)]
+    if isinstance(content, list):
+        return [fid for item in content for fid in _collect_file_ids(item)]
+    return []
+
+
 @pytest.mark.default_cassette("test_code_execution.yaml.gz")
 @pytest.mark.vcr
 @pytest.mark.parametrize("output_version", ["v0", "v1"])
 def test_code_execution(output_version: Literal["v0", "v1"]) -> None:
-    """Note: this is a beta feature.
-
-    TODO: Update to remove beta once generally available.
-    """
     llm = ChatAnthropic(
         model=MODEL_NAME,  # type: ignore[call-arg]
-        betas=["code-execution-2025-08-25"],
         output_version=output_version,
     )
 
@@ -1784,6 +1955,61 @@ def test_code_execution(output_version: Literal["v0", "v1"]) -> None:
     _ = llm_with_tools.invoke(
         [input_message, full, next_message],
     )
+
+
+@pytest.mark.default_cassette("test_skills.yaml.gz")
+@pytest.mark.vcr
+@pytest.mark.parametrize("output_version", ["v0", "v1"])
+def test_skills(output_version: Literal["v0", "v1"]) -> None:
+    """Load an Anthropic skill into the code execution container."""
+    skills = [{"type": "anthropic", "skill_id": "xlsx"}]
+    code_execution = {"type": "code_execution_20250825", "name": "code_execution"}
+    llm = ChatAnthropic(
+        model=MODEL_NAME,  # type: ignore[call-arg]
+        container={"skills": skills},
+        reuse_last_container=True,
+        output_version=output_version,
+    )
+    llm_with_tools = llm.bind_tools([code_execution])
+
+    input_message = {
+        "role": "user",
+        "content": "Create an xlsx file with a single cell containing the number 42.",
+    }
+
+    # Stream the first turn. `.output` blocks until the stream finishes and
+    # returns the aggregated message.
+    # `stream_events` is typed as `Iterator[Any]` on a bound model; the v3
+    # protocol returns a `ChatModelStream`.
+    stream = cast("Any", llm_with_tools.stream_events([input_message], version="v3"))
+    first_response = stream.output
+
+    # The skill ran in the container and wrote a file.
+    container_id = first_response.response_metadata["container"]["id"]
+    assert container_id
+    assert _collect_file_ids(first_response.content)
+
+    # `reuse_last_container` supplies the container ID on the next turn without
+    # dropping the skills.
+    messages: list = [
+        input_message,
+        first_response,
+        {"role": "user", "content": "Now change the cell to 43."},
+    ]
+    payload = llm._get_request_payload(messages, tools=[code_execution])
+    assert payload["container"] == {"id": container_id, "skills": skills}
+
+    # The aggregated stream is valid history, so the follow-up round-trips.
+    second_response = llm_with_tools.invoke(messages)
+    block_types = {block["type"] for block in second_response.content}  # type: ignore[index]
+    if output_version == "v0":
+        assert {
+            "text",
+            "server_tool_use",
+            "bash_code_execution_tool_result",
+        } <= block_types
+    else:
+        assert {"text", "server_tool_call", "server_tool_result"} <= block_types
 
 
 @pytest.mark.default_cassette("test_remote_mcp.yaml.gz")
@@ -2411,7 +2637,7 @@ def test_fine_grained_tool_streaming() -> None:
 
 @pytest.mark.vcr
 def test_compaction() -> None:
-    """Test the compation beta feature."""
+    """Test the compaction beta feature."""
     llm = ChatAnthropic(
         model="claude-opus-4-6",  # type: ignore[call-arg]
         betas=["compact-2026-01-12"],
@@ -2465,7 +2691,7 @@ def test_compaction() -> None:
 
 @pytest.mark.vcr
 def test_compaction_streaming() -> None:
-    """Test the compation beta feature."""
+    """Test the compaction beta feature."""
     llm = ChatAnthropic(
         model="claude-opus-4-6",  # type: ignore[call-arg]
         betas=["compact-2026-01-12"],
@@ -2516,3 +2742,96 @@ def test_compaction_streaming() -> None:
     third_response = llm.invoke(messages)
     content_blocks = third_response.content_blocks
     assert [block["type"] for block in content_blocks] == ["text"]
+
+
+class _Person(BaseModel):
+    """A person with a name and age."""
+
+    name: str = Field(description="The person's name")
+    age: int = Field(description="The person's age in years")
+
+
+def _stable_blocks(blocks: Any) -> list[dict[str, Any]]:
+    """Drop fields that vary between API calls so blocks can be compared.
+
+    Tool-call ids, wire indices, and provider extras are not path- or call-
+    stable; strip them so the comparison targets the semantic content.
+    """
+    volatile = {"id", "index", "extras"}
+    return [{k: v for k, v in b.items() if k not in volatile} for b in blocks]
+
+
+@pytest.mark.default_cassette("test_streaming_tool_call_v1_v2_parity.yaml.gz")
+@pytest.mark.vcr
+def test_streaming_tool_call_v1_v2_parity() -> None:
+    """`AIMessage` parity between `stream()` and `stream_events(version="v3")` output.
+
+    Runs the same forced-tool-call prompt through both the legacy chunk
+    stream (reduced with `AIMessageChunk.__add__`) and the `stream_events(version="v3")`
+    bridge path on a `v1`-output `ChatAnthropic`, then compares the
+    resulting messages on path-independent invariants:
+
+    - tool call name and args (ids vary between calls and are ignored)
+    - exactly one tool call, no invalid tool calls
+    - `content_blocks` (the v1 projection, stripped of volatile fields)
+    - a valid tool-use `finish_reason`
+
+    The v2 path is additionally validated against the full protocol
+    lifecycle via `assert_valid_event_stream`.
+    """
+    llm = ChatAnthropic(
+        model=MODEL_NAME,
+        output_version="v1",  # type: ignore[call-arg]
+    )
+    with_tool = llm.bind_tools(
+        [_Person],
+        tool_choice={"type": "tool", "name": "_Person"},
+    )
+    prompt = "Extract: Erick is 27 years old."
+
+    v1_full: AIMessageChunk | None = None
+    for chunk in with_tool.stream(prompt):
+        assert isinstance(chunk, AIMessageChunk)
+        v1_full = chunk if v1_full is None else v1_full + chunk
+    assert isinstance(v1_full, AIMessageChunk)
+
+    stream = cast("ChatModelStream", with_tool.stream_events(prompt, version="v3"))
+    events = list(stream)
+    assert_valid_event_stream(events)
+    v2_message = stream.output
+    assert isinstance(v2_message, AIMessage)
+
+    assert len(v1_full.tool_calls) == len(v2_message.tool_calls) == 1
+    assert not v1_full.invalid_tool_calls
+    assert not v2_message.invalid_tool_calls
+
+    v1_tc = v1_full.tool_calls[0]
+    v2_tc = v2_message.tool_calls[0]
+    assert v1_tc["name"] == v2_tc["name"] == "_Person"
+    assert v1_tc["args"] == v2_tc["args"] == {"name": "Erick", "age": 27}
+
+    v1_blocks = _stable_blocks(v1_full.content_blocks)
+    v2_blocks = _stable_blocks(v2_message.content_blocks)
+    assert v1_blocks == v2_blocks
+    assert v1_blocks == [
+        {
+            "type": "tool_call",
+            "name": "_Person",
+            "args": {"name": "Erick", "age": 27},
+        }
+    ]
+
+    # The compat bridge passes the provider's raw terminal reason through
+    # unchanged — Anthropic surfaces it under `stop_reason` on both paths.
+    # Accept either key on both sides rather than asserting a specific
+    # normalization that the bridge does not perform.
+    v1_finish = v1_full.response_metadata.get(
+        "finish_reason"
+    ) or v1_full.response_metadata.get("stop_reason")
+    v2_finish = v2_message.response_metadata.get(
+        "finish_reason"
+    ) or v2_message.response_metadata.get("stop_reason")
+    assert v1_finish is not None
+    assert v2_finish is not None
+    assert any(k in v1_finish for k in ("tool_use", "tool_calls", "stop"))
+    assert any(k in v2_finish for k in ("tool_use", "tool_calls", "stop"))

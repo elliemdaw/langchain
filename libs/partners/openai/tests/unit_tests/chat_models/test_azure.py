@@ -1,14 +1,20 @@
 """Test Azure OpenAI Chat API wrapper."""
 
 import os
+import warnings
 from unittest import mock
 
+import openai
 import pytest
 from langchain_core.messages import HumanMessage
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr
 from typing_extensions import TypedDict
 
 from langchain_openai import AzureChatOpenAI
+
+AZURE_PROFILE_TEST_MODEL = "gpt-5.5"
+AZURE_PROFILE_TEST_MODEL_NAME = "GPT-5.5"
+AZURE_PROFILE_TEST_MAX_INPUT_TOKENS = 1_050_000
 
 
 def test_initialize_azure_openai() -> None:
@@ -16,6 +22,7 @@ def test_initialize_azure_openai() -> None:
         azure_deployment="35-turbo-dev",
         openai_api_version="2023-05-15",
         azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
     )
     assert llm.deployment_name == "35-turbo-dev"
     assert llm.openai_api_version == "2023-05-15"
@@ -43,6 +50,92 @@ def test_initialize_more() -> None:
     ls_params = llm._get_ls_params()
     assert ls_params.get("ls_provider") == "azure"
     assert ls_params.get("ls_model_name") == "gpt-35-turbo-0125"
+
+
+def test_profile_resolves_from_model_name() -> None:
+    llm = AzureChatOpenAI(
+        model=AZURE_PROFILE_TEST_MODEL,
+        azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
+        api_version="2023-05-15",
+    )
+
+    assert llm.profile
+    assert llm.profile["name"] == AZURE_PROFILE_TEST_MODEL_NAME
+    assert llm.profile["max_input_tokens"] == AZURE_PROFILE_TEST_MAX_INPUT_TOKENS
+
+
+def test_profile_resolves_from_model_name_with_custom_deployment_alias() -> None:
+    llm = AzureChatOpenAI(
+        model=AZURE_PROFILE_TEST_MODEL,
+        azure_deployment="35-turbo-dev",
+        azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
+        api_version="2023-05-15",
+    )
+
+    assert llm.profile
+    assert llm.profile["name"] == AZURE_PROFILE_TEST_MODEL_NAME
+
+
+def test_profile_prefers_model_name_over_known_deployment_name() -> None:
+    llm = AzureChatOpenAI(
+        model=AZURE_PROFILE_TEST_MODEL,
+        azure_deployment=AZURE_PROFILE_TEST_MODEL,
+        azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
+        api_version="2023-05-15",
+    )
+
+    assert llm.profile
+    assert llm.profile["name"] == AZURE_PROFILE_TEST_MODEL_NAME
+
+
+def test_profile_falls_back_to_deployment_name_with_unknown_model() -> None:
+    llm = AzureChatOpenAI(
+        model="unknown-model",
+        azure_deployment=AZURE_PROFILE_TEST_MODEL,
+        azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
+        api_version="2023-05-15",
+    )
+
+    assert llm.profile
+
+
+def test_profile_resolves_from_deployment_name_without_model() -> None:
+    llm = AzureChatOpenAI(
+        azure_deployment=AZURE_PROFILE_TEST_MODEL,
+        azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
+        api_version="2023-05-15",
+    )
+
+    assert llm.profile
+    assert llm.profile["name"] == AZURE_PROFILE_TEST_MODEL_NAME
+
+
+def test_profile_respects_explicit_profile() -> None:
+    llm = AzureChatOpenAI(
+        model=AZURE_PROFILE_TEST_MODEL,
+        azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
+        api_version="2023-05-15",
+        profile={"tool_calling": False},
+    )
+
+    assert llm.profile == {"tool_calling": False}
+
+
+def test_profile_is_none_for_unknown_deployment_without_model() -> None:
+    llm = AzureChatOpenAI(
+        azure_deployment="unknown-deployment",
+        azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
+        api_version="2023-05-15",
+    )
+
+    assert llm.profile is None
 
 
 def test_initialize_azure_openai_with_openai_api_base_set() -> None:
@@ -79,6 +172,7 @@ def test_structured_output_old_model() -> None:
             azure_deployment="35-turbo-dev",
             openai_api_version="2023-05-15",
             azure_endpoint="my-base-url",
+            api_key=SecretStr("test"),
         ).with_structured_output(Output)
 
     # assert tool calling was used instead of json_schema
@@ -88,9 +182,10 @@ def test_structured_output_old_model() -> None:
 
 def test_max_completion_tokens_in_payload() -> None:
     llm = AzureChatOpenAI(
-        azure_deployment="o1-mini",
+        azure_deployment="gpt-5-nano",
         api_version="2024-12-01-preview",
         azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
         model_kwargs={"max_completion_tokens": 300},
     )
     messages = [HumanMessage("Hello")]
@@ -148,6 +243,7 @@ def test_max_completion_tokens_parameter() -> None:
         azure_deployment="gpt-5",
         api_version="2024-12-01-preview",
         azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
         max_completion_tokens=1500,
     )
     messages = [HumanMessage("Hello")]
@@ -165,6 +261,7 @@ def test_max_tokens_converted_to_max_completion_tokens() -> None:
         azure_deployment="gpt-5",
         api_version="2024-12-01-preview",
         azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
         max_tokens=1000,  # type: ignore[call-arg]
     )
     messages = [HumanMessage("Hello")]
@@ -174,3 +271,72 @@ def test_max_tokens_converted_to_max_completion_tokens() -> None:
     assert "max_completion_tokens" in payload
     assert payload["max_completion_tokens"] == 1000
     assert "max_tokens" not in payload
+
+
+def test_metadata_versions() -> None:
+    """Test that metadata reports the correct version info."""
+    llm = AzureChatOpenAI(  # type: ignore[call-arg]
+        azure_deployment="35-turbo-dev",
+        openai_api_version="2023-05-15",
+        azure_endpoint="my-base-url",
+    )
+    assert llm.metadata is not None
+    versions = llm.metadata["lc_versions"]
+    assert "langchain-core" in versions
+    assert "langchain-openai" in versions
+
+
+def test_create_chat_result_avoids_parsed_model_dump_warning() -> None:
+    """Azure structured output must not emit a serializer warning.
+
+    `AzureChatOpenAI._create_chat_result` re-dumps the response to read content-filter
+    metadata; with structured output the SDK's `parsed` field holds a model that
+    doesn't match its declared type (openai/openai-python#2872).
+    """
+    from openai.lib._parsing._completions import parse_chat_completion
+    from openai.types.chat import ChatCompletion
+    from openai.types.chat.chat_completion import Choice
+    from openai.types.chat.chat_completion_message import ChatCompletionMessage
+
+    class ModelOutput(BaseModel):
+        output: str
+
+    raw_response = ChatCompletion(
+        id="chatcmpl-1",
+        object="chat.completion",
+        created=0,
+        model="gpt-4o-mini",
+        choices=[
+            Choice(
+                index=0,
+                finish_reason="stop",
+                message=ChatCompletionMessage(
+                    role="assistant", content='{"output": "Paris"}'
+                ),
+            )
+        ],
+    )
+    parsed_response = parse_chat_completion(
+        response_format=ModelOutput,
+        input_tools=openai.omit,
+        chat_completion=raw_response,
+    )
+
+    llm = AzureChatOpenAI(  # type: ignore[call-arg]
+        azure_deployment="35-turbo-dev",
+        openai_api_version="2023-05-15",
+        azure_endpoint="my-base-url",
+        api_key=SecretStr("test"),
+    )
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        result = llm._create_chat_result(parsed_response)
+
+    warning_messages = [str(warning.message) for warning in caught_warnings]
+    assert not any(
+        "PydanticSerializationUnexpectedValue" in message
+        for message in warning_messages
+    )
+    assert result.generations[0].message.additional_kwargs["parsed"] == ModelOutput(
+        output="Paris"
+    )
