@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import functools
+import importlib
 import itertools
+import re
 from dataclasses import dataclass, field, fields
 from typing import (
     TYPE_CHECKING,
@@ -21,25 +24,31 @@ from langchain_core.tools import BaseTool
 from langgraph._internal._runnable import RunnableCallable
 from langgraph.constants import END, START
 from langgraph.graph.state import StateGraph
-from langgraph.prebuilt.tool_node import ToolCallWithContext, ToolNode
+from langgraph.prebuilt import ToolCallTransformer
+from langgraph.prebuilt.tool_node import ToolNode
 from langgraph.types import Command, Send
 from langsmith import traceable
-from typing_extensions import NotRequired, Required, TypedDict
+from typing_extensions import NotRequired, Required, TypedDict, overload
 
+from langchain.agents._subagent_transformer import SubagentTransformer
+from langchain.agents.middleware._trace_policy import (
+    _node_trace_policy,
+    _resolved_transform,
+)
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     AgentState,
     ContextT,
     ExtendedModelResponse,
+    InputAgentState,
     JumpTo,
     ModelRequest,
     ModelResponse,
     OmitFromSchema,
+    OutputAgentState,
     ResponseT,
     StateT_co,
     ToolCallRequest,
-    _InputAgentState,
-    _OutputAgentState,
 )
 from langchain.agents.structured_output import (
     AutoStrategy,
@@ -57,9 +66,9 @@ from langchain.chat_models import init_chat_model
 
 @dataclass
 class _ComposedExtendedModelResponse(Generic[ResponseT]):
-    """Internal result from composed ``wrap_model_call`` middleware.
+    """Internal result from composed `wrap_model_call` middleware.
 
-    Unlike ``ExtendedModelResponse`` (user-facing, single command), this holds the
+    Unlike `ExtendedModelResponse` (user-facing, single command), this holds the
     full list of commands accumulated across all middleware layers during
     composition.
     """
@@ -72,13 +81,14 @@ class _ComposedExtendedModelResponse(Generic[ResponseT]):
 
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Sequence
 
     from langchain_core.runnables import Runnable, RunnableConfig
     from langgraph.cache.base import BaseCache
     from langgraph.graph.state import CompiledStateGraph
     from langgraph.runtime import Runtime
     from langgraph.store.base import BaseStore
+    from langgraph.stream._mux import TransformerFactory
     from langgraph.types import Checkpointer
 
     from langchain.agents.middleware.types import ToolCallWrapper
@@ -134,7 +144,7 @@ Option 2: Handle dynamic tools in middleware (for tools created at runtime)
 
 
 def _scrub_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
-    """Remove ``runtime`` and ``handler`` from trace inputs before sending to LangSmith."""
+    """Remove `runtime` and `handler` from trace inputs before sending to LangSmith."""
     filtered = inputs.copy()
     filtered.pop("handler", None)
     req = filtered.get("request")
@@ -145,16 +155,42 @@ def _scrub_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
     return filtered
 
 
+def _wrap_trace_kwargs(middleware: AgentMiddleware[Any, Any]) -> dict[str, Any]:
+    """`traceable` kwargs for a middleware's `wrap_*` hook spans.
+
+    The `_scrub_inputs` baseline (strip the unserializable `handler`/`runtime`) always
+    runs first; the effective `TracePolicy` (the middleware's own, else the process-wide
+    default) composes on top. The effective policy is resolved at call time, so a
+    `configure_trace_policy` call after `create_agent` still applies.
+    """
+    process_inputs = _resolved_transform(middleware.trace_policy, "process_inputs")
+    process_outputs = _resolved_transform(middleware.trace_policy, "process_outputs")
+    return {
+        "process_inputs": lambda inputs: process_inputs(_scrub_inputs(inputs)),
+        "process_outputs": process_outputs,
+    }
+
+
 FALLBACK_MODELS_WITH_STRUCTURED_OUTPUT = [
-    # if model profile data are not available, these models are assumed to support
-    # structured output
-    "grok",
-    "gpt-5",
-    "gpt-4.1",
-    "gpt-4o",
-    "gpt-oss",
-    "o3-pro",
-    "o3-mini",
+    # If model profile data are not available, model names matching these patterns
+    # are assumed to support provider-native structured output. These are regexes
+    # so matches stay bounded to model-name segments instead of arbitrary substrings.
+    r"(^|[/:.])gpt-4\.1($|[-/:])",
+    r"(^|[/:.])gpt-4o($|[-/:])",
+    r"(^|[/:.])gpt-5($|[-/:])",
+    r"(^|[/:.])gpt-5\.1($|[-/:])",
+    r"(^|[/:.])gpt-5\.2(-\d{4}-\d{2}-\d{2})?($|[/:])",
+    r"(^|[/:.])gpt-5\.2-(chat|codex)($|[-/:])",
+    r"(^|[/:.])gpt-5\.3($|[-/:])",
+    r"(^|[/:.])gpt-5\.4(-\d{4}-\d{2}-\d{2})?($|[/:])",
+    r"(^|[/:.])gpt-5\.4-(mini|nano)($|[-/:])",
+    r"(^|[/:.])gpt-5\.5($|[-/:])",
+    r"(^|[/:.])claude-(fable|mythos)-5(?:-\d{8})?(?:-v\d(?::\d)?)?($|[/:])",
+    r"(^|[/:.])claude-haiku-4-5(?:-\d{8})?(?:-v\d(?::\d)?)?($|[/:])",
+    r"(^|[/:.])claude-opus-4-(5|6|7|8)(?:-\d{8})?(?:-v\d(?::\d)?)?($|[/:])",
+    r"(^|[/:.])claude-sonnet-4-(5|6)(?:-\d{8})?(?:-v\d(?::\d)?)?($|[/:])",
+    r"(^|[/:.])grok-4($|[-.:/])",
+    r"(^|[/:.])grok-build($|[-/:])",
 ]
 
 
@@ -163,8 +199,8 @@ def _normalize_to_model_response(
 ) -> ModelResponse:
     """Normalize middleware return value to ModelResponse.
 
-    At inner composition boundaries, ``ExtendedModelResponse`` is unwrapped to its
-    underlying ``ModelResponse`` so that inner middleware always sees ``ModelResponse``
+    At inner composition boundaries, `ExtendedModelResponse` is unwrapped to its
+    underlying `ModelResponse` so that inner middleware always sees `ModelResponse`
     from the handler.
     """
     if isinstance(result, AIMessage):
@@ -177,6 +213,8 @@ def _normalize_to_model_response(
 def _build_commands(
     model_response: ModelResponse,
     middleware_commands: list[Command[Any]] | None = None,
+    *,
+    has_structured_output: bool = False,
 ) -> list[Command[Any]]:
     """Build a list of Commands from a model response and middleware commands.
 
@@ -188,14 +226,20 @@ def _build_commands(
             structured output.
         middleware_commands: Commands accumulated from middleware layers during
             composition (inner-first ordering).
+        has_structured_output: Whether the agent was configured with a
+            `response_format`. When `True` and no structured response was
+            produced, `structured_response` is explicitly cleared to avoid a
+            stale value from a previous checkpointed turn.
 
     Returns:
-        List of ``Command`` objects ready to be returned from a model node.
+        List of `Command` objects ready to be returned from a model node.
     """
     state: dict[str, Any] = {"messages": model_response.result}
 
     if model_response.structured_response is not None:
         state["structured_response"] = model_response.structured_response
+    elif has_structured_output:
+        state["structured_response"] = None
 
     for cmd in middleware_commands or []:
         if cmd.goto:
@@ -219,7 +263,7 @@ def _build_commands(
 def _chain_model_call_handlers(
     handlers: Sequence[_ModelCallHandler[ContextT]],
 ) -> _ComposedModelCallHandler[ContextT] | None:
-    """Compose multiple ``wrap_model_call`` handlers into single middleware stack.
+    """Compose multiple `wrap_model_call` handlers into single middleware stack.
 
     Composes handlers so first in list becomes outermost layer. Each handler receives a
     handler callback to execute inner layers. Commands from each layer are accumulated
@@ -231,8 +275,8 @@ def _chain_model_call_handlers(
             First handler wraps all others.
 
     Returns:
-        Composed handler returning ``_ComposedExtendedModelResponse``,
-        or ``None`` if handlers empty.
+        Composed handler returning `_ComposedExtendedModelResponse`,
+        or `None` if handlers empty.
     """
     if not handlers:
         return None
@@ -311,7 +355,7 @@ def _chain_model_call_handlers(
 def _chain_async_model_call_handlers(
     handlers: Sequence[_AsyncModelCallHandler[ContextT]],
 ) -> _ComposedAsyncModelCallHandler[ContextT] | None:
-    """Compose multiple async ``wrap_model_call`` handlers into single middleware stack.
+    """Compose multiple async `wrap_model_call` handlers into single middleware stack.
 
     Commands from each layer are accumulated into a list (inner-first, then outer)
     without merging.
@@ -322,8 +366,8 @@ def _chain_async_model_call_handlers(
             First handler wraps all others.
 
     Returns:
-        Composed async handler returning ``_ComposedExtendedModelResponse``,
-        or ``None`` if handlers empty.
+        Composed async handler returning `_ComposedExtendedModelResponse`,
+        or `None` if handlers empty.
     """
     if not handlers:
         return None
@@ -399,11 +443,40 @@ def _chain_async_model_call_handlers(
     return composed_handler
 
 
-def _resolve_schema(schemas: set[type], schema_name: str, omit_flag: str | None = None) -> type:
+@functools.lru_cache(maxsize=100)
+def _get_schema_type_hints(schema: type) -> dict[str, Any]:
+    """Return cached type hints for a schema."""
+    return get_type_hints(schema, include_extras=True)
+
+
+def _resolve_schemas(schemas: list[type]) -> tuple[type, type, type]:
+    """Resolve state, input, and output schemas for the given schemas.
+
+    Schemas are merged in list order; later entries override earlier ones when the
+    same field is declared by multiple schemas.  Duplicates are harmless — a type
+    that appears more than once is processed at its last position.
+    """
+    schema_hints: dict[type, dict[str, Any]] = {}
+    for schema in schemas:
+        # Reinsert duplicates so dict iteration reflects their final position.
+        schema_hints.pop(schema, None)
+        schema_hints[schema] = _get_schema_type_hints(schema)
+    return (
+        _resolve_schema(schema_hints, "StateSchema", None),
+        _resolve_schema(schema_hints, "InputSchema", "input"),
+        _resolve_schema(schema_hints, "OutputSchema", "output"),
+    )
+
+
+def _resolve_schema(
+    schema_hints: dict[type, dict[str, Any]],
+    schema_name: str,
+    omit_flag: str | None = None,
+) -> type:
     """Resolve schema by merging schemas and optionally respecting `OmitFromSchema` annotations.
 
     Args:
-        schemas: List of schema types to merge
+        schema_hints: Resolved schema annotations to merge
         schema_name: Name for the generated `TypedDict`
         omit_flag: If specified, omit fields with this flag set (`'input'` or
             `'output'`)
@@ -413,14 +486,11 @@ def _resolve_schema(schemas: set[type], schema_name: str, omit_flag: str | None 
     """
     all_annotations = {}
 
-    for schema in schemas:
-        hints = get_type_hints(schema, include_extras=True)
-
+    for hints in schema_hints.values():
         for field_name, field_type in hints.items():
             should_omit = False
 
             if omit_flag:
-                # Check for omission in the annotation metadata
                 metadata = _extract_metadata(field_type)
                 for meta in metadata:
                     if isinstance(meta, OmitFromSchema) and getattr(meta, omit_flag) is True:
@@ -430,7 +500,9 @@ def _resolve_schema(schemas: set[type], schema_name: str, omit_flag: str | None 
             if not should_omit:
                 all_annotations[field_name] = field_type
 
-    return TypedDict(schema_name, all_annotations)  # type: ignore[operator]
+    # `TypedDict` dynamically creates a class, but type checkers don't infer that
+    # the runtime result satisfies this function's `type` return contract.
+    return cast("type", TypedDict(schema_name, all_annotations))  # type: ignore[operator]
 
 
 def _extract_metadata(type_: type) -> list[Any]:
@@ -469,7 +541,8 @@ def _get_can_jump_to(middleware: AgentMiddleware[Any, Any], hook_name: str) -> l
         and sync_method is not base_sync_method
         and hasattr(sync_method, "__can_jump_to__")
     ):
-        return sync_method.__can_jump_to__
+        # `hasattr` proves the metadata exists at runtime, but not its value type.
+        return cast("list[JumpTo]", sync_method.__can_jump_to__)
 
     # Try async method - only if it's overridden from base class
     async_method = getattr(middleware.__class__, f"a{hook_name}", None)
@@ -478,7 +551,8 @@ def _get_can_jump_to(middleware: AgentMiddleware[Any, Any], hook_name: str) -> l
         and async_method is not base_async_method
         and hasattr(async_method, "__can_jump_to__")
     ):
-        return async_method.__can_jump_to__
+        # `hasattr` proves the metadata exists at runtime, but not its value type.
+        return cast("list[JumpTo]", async_method.__can_jump_to__)
 
     return []
 
@@ -522,10 +596,33 @@ def _supports_provider_strategy(
             return True
 
     return (
-        any(part in model_name.lower() for part in FALLBACK_MODELS_WITH_STRUCTURED_OUTPUT)
+        any(
+            re.search(pattern, model_name.lower())
+            for pattern in FALLBACK_MODELS_WITH_STRUCTURED_OUTPUT
+        )
         if model_name
         else False
     )
+
+
+def _is_openai_compatible_model(model: BaseChatModel) -> bool:
+    """Check if a model inherits from `BaseChatOpenAI`.
+
+    Used to redundantly set `strict=True` on tools when `response_format` is
+    provided, as older versions of `langchain-openai` do not auto-set it.
+    Covers `ChatOpenAI`, `ChatDeepSeek`, `ChatXAI`, etc.
+
+    Args:
+        model: The chat model to check.
+
+    Returns:
+        `True` if the model inherits from `BaseChatOpenAI`, `False` otherwise.
+    """
+    try:
+        base_chat_openai = importlib.import_module("langchain_openai.chat_models.base")
+    except ImportError:
+        return False
+    return isinstance(model, base_chat_openai.BaseChatOpenAI)
 
 
 def _handle_structured_output_error(
@@ -670,6 +767,76 @@ def _chain_async_tool_call_wrappers(
     return result
 
 
+# No `response_format`: there is no structured output, so `ResponseT` resolves to `Any`.
+@overload
+def create_agent(
+    model: str | BaseChatModel,
+    tools: Sequence[BaseTool | Callable[..., Any] | dict[str, Any]] | None = None,
+    *,
+    system_prompt: str | SystemMessage | None = None,
+    middleware: Sequence[AgentMiddleware[StateT_co, ContextT]] = (),
+    response_format: None = None,
+    state_schema: None = None,
+    context_schema: type[ContextT] | None = None,
+    checkpointer: Checkpointer | None = None,
+    store: BaseStore | None = None,
+    interrupt_before: list[str] | None = None,
+    interrupt_after: list[str] | None = None,
+    debug: bool = False,
+    name: str | None = None,
+    cache: BaseCache[Any] | None = None,
+    transformers: Sequence[TransformerFactory] | None = None,
+) -> CompiledStateGraph[AgentState[Any], ContextT, InputAgentState, OutputAgentState[Any]]: ...
+
+
+# Raw-dict `response_format`: structured output is an untyped `dict[str, Any]`.
+@overload
+def create_agent(
+    model: str | BaseChatModel,
+    tools: Sequence[BaseTool | Callable[..., Any] | dict[str, Any]] | None = None,
+    *,
+    system_prompt: str | SystemMessage | None = None,
+    middleware: Sequence[AgentMiddleware[StateT_co, ContextT]] = (),
+    response_format: dict[str, Any],
+    state_schema: type[AgentState[dict[str, Any]]] | None = None,
+    context_schema: type[ContextT] | None = None,
+    checkpointer: Checkpointer | None = None,
+    store: BaseStore | None = None,
+    interrupt_before: list[str] | None = None,
+    interrupt_after: list[str] | None = None,
+    debug: bool = False,
+    name: str | None = None,
+    cache: BaseCache[Any] | None = None,
+    transformers: Sequence[TransformerFactory] | None = None,
+) -> CompiledStateGraph[
+    AgentState[dict[str, Any]], ContextT, InputAgentState, OutputAgentState[dict[str, Any]]
+]: ...
+
+
+# Schema-typed `response_format`: `ResponseT` is inferred from the schema/type.
+@overload
+def create_agent(
+    model: str | BaseChatModel,
+    tools: Sequence[BaseTool | Callable[..., Any] | dict[str, Any]] | None = None,
+    *,
+    system_prompt: str | SystemMessage | None = None,
+    middleware: Sequence[AgentMiddleware[StateT_co, ContextT]] = (),
+    response_format: ResponseFormat[ResponseT] | type[ResponseT] | None = None,
+    state_schema: type[AgentState[ResponseT]] | None = None,
+    context_schema: type[ContextT] | None = None,
+    checkpointer: Checkpointer | None = None,
+    store: BaseStore | None = None,
+    interrupt_before: list[str] | None = None,
+    interrupt_after: list[str] | None = None,
+    debug: bool = False,
+    name: str | None = None,
+    cache: BaseCache[Any] | None = None,
+    transformers: Sequence[TransformerFactory] | None = None,
+) -> CompiledStateGraph[
+    AgentState[ResponseT], ContextT, InputAgentState, OutputAgentState[ResponseT]
+]: ...
+
+
 def create_agent(
     model: str | BaseChatModel,
     tools: Sequence[BaseTool | Callable[..., Any] | dict[str, Any]] | None = None,
@@ -686,8 +853,9 @@ def create_agent(
     debug: bool = False,
     name: str | None = None,
     cache: BaseCache[Any] | None = None,
+    transformers: Sequence[TransformerFactory] | None = None,
 ) -> CompiledStateGraph[
-    AgentState[ResponseT], ContextT, _InputAgentState, _OutputAgentState[ResponseT]
+    AgentState[ResponseT], ContextT, InputAgentState, OutputAgentState[ResponseT]
 ]:
     """Creates an agent graph that calls tools in a loop until a stopping condition is met.
 
@@ -697,7 +865,7 @@ def create_agent(
     Args:
         model: The language model for the agent.
 
-            Can be a string identifier (e.g., `"openai:gpt-4"`) or a direct chat model
+            Can be a string identifier (e.g., `"openai:gpt-5.5"`) or a direct chat model
             instance (e.g., [`ChatOpenAI`][langchain_openai.ChatOpenAI] or other another
             [LangChain chat model](https://docs.langchain.com/oss/python/integrations/chat)).
 
@@ -781,6 +949,13 @@ def create_agent(
             another graph as a subgraph node - particularly useful for building
             multi-agent systems.
         cache: An optional `BaseCache` instance to enable caching of graph execution.
+        transformers: Optional sequence of scope-aware `StreamTransformer`
+            factories to register on the compiled graph in addition to
+            the agent defaults. Each factory is invoked as `factory(scope)`
+            so every invocation receives a fresh instance. The final order
+            on the compiled graph is: `ToolCallTransformer`, then any
+            factories declared by middleware via
+            `AgentMiddleware.transformers`, then any factories supplied here.
 
     Returns:
         A compiled `StateGraph` that can be used for chat interactions.
@@ -839,11 +1014,8 @@ def create_agent(
     initial_response_format: ToolStrategy[Any] | ProviderStrategy[Any] | AutoStrategy[Any] | None
     if response_format is None:
         initial_response_format = None
-    elif isinstance(response_format, (ToolStrategy, ProviderStrategy)):
-        # Preserve explicitly requested strategies
-        initial_response_format = response_format
-    elif isinstance(response_format, AutoStrategy):
-        # AutoStrategy provided - preserve it for later auto-detection
+    elif isinstance(response_format, (ToolStrategy, ProviderStrategy, AutoStrategy)):
+        # Explicit Tool/Provider strategy, or AutoStrategy for later capability detection
         initial_response_format = response_format
     else:
         # Raw schema - wrap in AutoStrategy to enable auto-detection
@@ -878,9 +1050,7 @@ def create_agent(
     wrap_tool_call_wrapper = None
     if middleware_w_wrap_tool_call:
         wrappers = [
-            traceable(name=f"{m.name}.wrap_tool_call", process_inputs=_scrub_inputs)(
-                m.wrap_tool_call
-            )
+            traceable(name=f"{m.name}.wrap_tool_call", **_wrap_trace_kwargs(m))(m.wrap_tool_call)
             for m in middleware_w_wrap_tool_call
         ]
         wrap_tool_call_wrapper = _chain_tool_call_wrappers(wrappers)
@@ -899,9 +1069,7 @@ def create_agent(
     awrap_tool_call_wrapper = None
     if middleware_w_awrap_tool_call:
         async_wrappers = [
-            traceable(name=f"{m.name}.awrap_tool_call", process_inputs=_scrub_inputs)(
-                m.awrap_tool_call
-            )
+            traceable(name=f"{m.name}.awrap_tool_call", **_wrap_trace_kwargs(m))(m.awrap_tool_call)
             for m in middleware_w_awrap_tool_call
         ]
         awrap_tool_call_wrapper = _chain_async_tool_call_wrappers(async_wrappers)
@@ -987,9 +1155,7 @@ def create_agent(
     wrap_model_call_handler = None
     if middleware_w_wrap_model_call:
         sync_handlers = [
-            traceable(name=f"{m.name}.wrap_model_call", process_inputs=_scrub_inputs)(
-                m.wrap_model_call
-            )
+            traceable(name=f"{m.name}.wrap_model_call", **_wrap_trace_kwargs(m))(m.wrap_model_call)
             for m in middleware_w_wrap_model_call
         ]
         wrap_model_call_handler = _chain_model_call_handlers(sync_handlers)
@@ -998,25 +1164,26 @@ def create_agent(
     awrap_model_call_handler = None
     if middleware_w_awrap_model_call:
         async_handlers = [
-            traceable(name=f"{m.name}.awrap_model_call", process_inputs=_scrub_inputs)(
+            traceable(name=f"{m.name}.awrap_model_call", **_wrap_trace_kwargs(m))(
                 m.awrap_model_call
             )
             for m in middleware_w_awrap_model_call
         ]
         awrap_model_call_handler = _chain_async_model_call_handlers(async_handlers)
 
-    state_schemas: set[type] = {m.state_schema for m in middleware}
-    # Use provided state_schema if available, otherwise use base AgentState
     base_state = state_schema if state_schema is not None else AgentState
-    state_schemas.add(base_state)
+    # Build an ordered list: middleware schemas first (in registration order),
+    # base_state last so it wins any field conflict.  This lets the caller's
+    # explicit state_schema override middleware annotations — e.g. passing
+    # a DeltaChannel-annotated schema wins over BinaryOperatorAggregate from
+    # AgentState without requiring a post-compilation patch.
+    state_schemas: list[type] = [*(m.state_schema for m in middleware), base_state]
 
-    resolved_state_schema = _resolve_schema(state_schemas, "StateSchema", None)
-    input_schema = _resolve_schema(state_schemas, "InputSchema", "input")
-    output_schema = _resolve_schema(state_schemas, "OutputSchema", "output")
+    resolved_state_schema, input_schema, output_schema = _resolve_schemas(state_schemas)
 
     # create graph, add nodes
     graph: StateGraph[
-        AgentState[ResponseT], ContextT, _InputAgentState, _OutputAgentState[ResponseT]
+        AgentState[ResponseT], ContextT, InputAgentState, OutputAgentState[ResponseT]
     ] = StateGraph(
         state_schema=resolved_state_schema,
         input_schema=input_schema,
@@ -1207,18 +1374,32 @@ def create_agent(
         # and dicts (built-ins)
         final_tools = list(request.tools)
         if isinstance(effective_response_format, ToolStrategy):
-            # Add structured output tools to final tools list
-            structured_tools = [info.tool for info in structured_output_tools.values()]
+            # Add structured output tools to final tools list, narrowed to only the
+            # schemas present in the (possibly middleware-narrowed) response format.
+            # This ensures middleware that narrows a union `ToolStrategy` to a subset
+            # via `request.override()` actually restricts which structured output
+            # tools the model can choose from.
+            narrowed_tool_names = {spec.name for spec in effective_response_format.schema_specs}
+            structured_tools = [
+                info.tool
+                for name, info in structured_output_tools.items()
+                if name in narrowed_tool_names
+            ]
             final_tools.extend(structured_tools)
 
         # Bind model based on effective response format
         if isinstance(effective_response_format, ProviderStrategy):
             # (Backward compatibility) Use OpenAI format structured output
+            # Redundantly set strict=True on tools for OpenAI-compatible models, as older
+            # versions of langchain-openai do not auto-set it in bind_tools.
             kwargs = effective_response_format.to_model_kwargs()
+            bind_kwargs: dict[str, Any] = {**kwargs, **request.model_settings}
+            if _is_openai_compatible_model(request.model) and not getattr(
+                request.model, "use_responses_api", False
+            ):
+                bind_kwargs["strict"] = True
             return (
-                request.model.bind_tools(
-                    final_tools, strict=True, **kwargs, **request.model_settings
-                ),
+                request.model.bind_tools(final_tools, **bind_kwargs),
                 effective_response_format,
             )
 
@@ -1297,12 +1478,15 @@ def create_agent(
             runtime=runtime,
         )
 
+        has_structured_output = initial_response_format is not None
         if wrap_model_call_handler is None:
             model_response = _execute_model_sync(request)
-            return _build_commands(model_response)
+            return _build_commands(model_response, has_structured_output=has_structured_output)
 
         result = wrap_model_call_handler(request, _execute_model_sync)
-        return _build_commands(result.model_response, result.commands)
+        return _build_commands(
+            result.model_response, result.commands, has_structured_output=has_structured_output
+        )
 
     async def _execute_model_async(request: ModelRequest[ContextT]) -> ModelResponse:
         """Execute model asynchronously and return response.
@@ -1345,12 +1529,15 @@ def create_agent(
             runtime=runtime,
         )
 
+        has_structured_output = initial_response_format is not None
         if awrap_model_call_handler is None:
             model_response = await _execute_model_async(request)
-            return _build_commands(model_response)
+            return _build_commands(model_response, has_structured_output=has_structured_output)
 
         result = await awrap_model_call_handler(request, _execute_model_async)
-        return _build_commands(result.model_response, result.commands)
+        return _build_commands(
+            result.model_response, result.commands, has_structured_output=has_structured_output
+        )
 
     # Use sync or async based on model capabilities
     graph.add_node("model", RunnableCallable(model_node, amodel_node, trace=False))
@@ -1379,7 +1566,10 @@ def create_agent(
             )
             before_agent_node = RunnableCallable(sync_before_agent, async_before_agent, trace=False)
             graph.add_node(
-                f"{m.name}.before_agent", before_agent_node, input_schema=resolved_state_schema
+                f"{m.name}.before_agent",
+                before_agent_node,
+                input_schema=resolved_state_schema,
+                trace_policy=_node_trace_policy(m.trace_policy),
             )
 
         if (
@@ -1400,7 +1590,10 @@ def create_agent(
             )
             before_node = RunnableCallable(sync_before, async_before, trace=False)
             graph.add_node(
-                f"{m.name}.before_model", before_node, input_schema=resolved_state_schema
+                f"{m.name}.before_model",
+                before_node,
+                input_schema=resolved_state_schema,
+                trace_policy=_node_trace_policy(m.trace_policy),
             )
 
         if (
@@ -1420,7 +1613,12 @@ def create_agent(
                 else None
             )
             after_node = RunnableCallable(sync_after, async_after, trace=False)
-            graph.add_node(f"{m.name}.after_model", after_node, input_schema=resolved_state_schema)
+            graph.add_node(
+                f"{m.name}.after_model",
+                after_node,
+                input_schema=resolved_state_schema,
+                trace_policy=_node_trace_policy(m.trace_policy),
+            )
 
         if (
             m.__class__.after_agent is not AgentMiddleware.after_agent
@@ -1440,7 +1638,10 @@ def create_agent(
             )
             after_agent_node = RunnableCallable(sync_after_agent, async_after_agent, trace=False)
             graph.add_node(
-                f"{m.name}.after_agent", after_agent_node, input_schema=resolved_state_schema
+                f"{m.name}.after_agent",
+                after_agent_node,
+                input_schema=resolved_state_schema,
+                trace_policy=_node_trace_policy(m.trace_policy),
             )
 
     # Determine the entry node (runs once at start): before_agent -> before_model -> model
@@ -1497,14 +1698,10 @@ def create_agent(
             tools_to_model_destinations,
         )
 
-        # base destinations are tools and exit_node
-        # we add the loop_entry node to edge destinations if:
-        # - there is an after model hook(s) -- allows jump_to to model
-        #   potentially artificially injected tool messages, ex HITL
-        # - there is a response format -- to allow for jumping to model to handle
-        #   regenerating structured output tool calls
+        # Include loop_entry_node when middleware can inject synthetic tool
+        # messages, or when structured output or after-model hooks can reroute there.
         model_to_tools_destinations = ["tools", exit_node]
-        if response_format or loop_exit_node != "model":
+        if response_format or loop_exit_node != "model" or middleware_w_wrap_model_call:
             model_to_tools_destinations.append(loop_entry_node)
 
         graph.add_conditional_edges(
@@ -1629,9 +1826,17 @@ def create_agent(
             can_jump_to=_get_can_jump_to(middleware_w_after_agent[0], "after_agent"),
         )
 
-    config: RunnableConfig = {"recursion_limit": 10_000}
+    # Set recursion limit to 9_999
+    # https://github.com/langchain-ai/langgraph/issues/7313
+    config: RunnableConfig = {"recursion_limit": 9_999}
+    config["metadata"] = {"ls_integration": "langchain_create_agent"}
     if name:
-        config["metadata"] = {"lc_agent_name": name}
+        config["metadata"]["lc_agent_name"] = name
+
+    # Middleware that makes internal model calls (e.g. `SummarizationMiddleware`)
+    # each declare `InternalCallTransformer` on their own `transformers` tuple so
+    # it's only registered when one of them is actually in use.
+    middleware_transformers = [t for m in middleware for t in getattr(m, "transformers", ())]
 
     return graph.compile(
         checkpointer=checkpointer,
@@ -1641,7 +1846,42 @@ def create_agent(
         debug=debug,
         name=name,
         cache=cache,
+        transformers=_dedupe_transformers(
+            [
+                ToolCallTransformer,
+                SubagentTransformer,
+                *middleware_transformers,
+                *(transformers or ()),
+            ]
+        ),
     ).with_config(config)
+
+
+def _dedupe_transformers(
+    factories: Iterable[TransformerFactory],
+) -> list[TransformerFactory]:
+    """Order-preserving de-dup of transformer factories, by identity.
+
+    `AgentMiddleware.transformers` accepts any scope-aware callable, and
+    callables aren't required to be hashable (e.g. a dataclass-based factory
+    with `__hash__ = None`), so this can't use a `set`/`dict` keyed on the
+    factories themselves. Combining several middleware that each declare the
+    same shared transformer class (e.g. `InternalCallTransformer`) would
+    otherwise register it once per middleware.
+
+    Args:
+        factories: Transformer factories to de-dup, in registration order.
+
+    Returns:
+        The same factories with exact repeats (by `is`) removed, order kept.
+    """
+    seen_ids: set[int] = set()
+    deduped: list[TransformerFactory] = []
+    for factory in factories:
+        if id(factory) not in seen_ids:
+            seen_ids.add(id(factory))
+            deduped.append(factory)
+    return deduped
 
 
 def _resolve_jump(
@@ -1716,22 +1956,15 @@ def _make_model_to_tools_edge(
             if c["id"] not in tool_message_ids and c["name"] not in structured_output_tools
         ]
 
-        # 4. If there are pending tool calls, jump to the tool node
+        # 4. If there are pending tool calls, jump to the tool node.
+        # The tool node hydrates ToolRuntime.state from channels via
+        # CONFIG_KEY_READ at execution time, so we no longer inline the
+        # full state into each Send (previously O(N^2) in TASKS writes).
         if pending_tool_calls:
-            return [
-                Send(
-                    "tools",
-                    ToolCallWithContext(
-                        __type="tool_call_with_context",
-                        tool_call=tool_call,
-                        state=state,
-                    ),
-                )
-                for tool_call in pending_tool_calls
-            ]
+            return [Send("tools", [tool_call]) for tool_call in pending_tool_calls]
 
-        # 5. If there is a structured response, exit the loop
-        if "structured_response" in state:
+        # 5. If a fresh structured response was produced this call, exit the loop
+        if state.get("structured_response") is not None:
             return end_destination
 
         # 6. AIMessage has tool calls, but there are no pending tool calls which suggests
@@ -1757,8 +1990,8 @@ def _make_model_to_model_edge(
                 end_destination=end_destination,
             )
 
-        # 2. Exit condition: A structured response was generated
-        if "structured_response" in state:
+        # 2. Exit condition: a fresh structured response was generated this call
+        if state.get("structured_response") is not None:
             return end_destination
 
         # 3. Default: Continue the loop, there may have been an issue with structured
@@ -1806,7 +2039,7 @@ def _make_tools_to_model_edge(
 
 def _add_middleware_edge(
     graph: StateGraph[
-        AgentState[ResponseT], ContextT, _InputAgentState, _OutputAgentState[ResponseT]
+        AgentState[ResponseT], ContextT, InputAgentState, OutputAgentState[ResponseT]
     ],
     *,
     name: str,

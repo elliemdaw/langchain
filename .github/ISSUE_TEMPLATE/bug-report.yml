@@ -22,7 +22,7 @@ body:
   - type: checkboxes
     id: checks
     attributes:
-      label: Checked other resources
+      label: Submission checklist
       description: Please confirm and check all the following options.
       options:
         - label: This is a bug, not a usage question.
@@ -151,3 +151,14 @@ body:
         python -m langchain_core.sys_info
     validations:
       required: true
+  - type: textarea
+    id: social-handles
+    attributes:
+      label: Social handles (optional)
+      description: |
+        If you'd like a shoutout on release, add your socials below.
+      placeholder: |
+        Twitter: @
+        LinkedIn: https://linkedin.com/in/
+    validations:
+      required: false
