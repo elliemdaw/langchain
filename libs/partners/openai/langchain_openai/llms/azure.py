@@ -12,6 +12,7 @@ from langchain_core.utils import from_env, secret_from_env
 from pydantic import Field, SecretStr, model_validator
 from typing_extensions import Self
 
+from langchain_openai._version import __version__
 from langchain_openai.llms.base import BaseOpenAI
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,12 @@ class AzureOpenAI(BaseOpenAI):
         return True
 
     @model_validator(mode="after")
+    def _set_azure_openai_version(self) -> Self:
+        """Set package version in metadata."""
+        self._add_version("langchain-openai", __version__)
+        return self
+
+    @model_validator(mode="after")
     def validate_environment(self) -> Self:
         """Validate that api key and python package exists in environment."""
         if self.n < 1:
@@ -169,12 +176,22 @@ class AzureOpenAI(BaseOpenAI):
             "timeout": self.request_timeout,
             "max_retries": self.max_retries,
             "default_headers": {
-                **(self.default_headers or {}),
                 "User-Agent": "langchain-partner-python-azure-openai",
+                **(self.default_headers or {}),
             },
             "default_query": self.default_query,
         }
-        if not self.client:
+        if (
+            self.azure_ad_token
+            or self.azure_ad_token_provider
+            or self.azure_ad_async_token_provider
+        ):
+            client_params["api_key"] = None
+        if not self.client and (
+            not self.azure_ad_async_token_provider
+            or self.azure_ad_token
+            or self.azure_ad_token_provider
+        ):
             sync_specific = {"http_client": self.http_client}
             self.client = openai.AzureOpenAI(
                 **client_params,
